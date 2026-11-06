@@ -1,6 +1,12 @@
 use super::*;
 use http_body_util::BodyExt;
 
+/// Заглушка живого списка устройств (форк добавил 6-й аргумент
+/// list_devices в handle_request/serve_web_ui).
+fn no_devices() -> Vec<String> {
+    Vec::new()
+}
+
 fn policy(remote: bool, token: Option<&str>) -> ControlPolicy {
     ControlPolicy {
         local: "127.0.0.1:9741".parse().unwrap(),
@@ -45,7 +51,7 @@ async fn rejected(req: Request<Full<Bytes>>, policy: ControlPolicy, expected: St
     let (status, _reader) = BridgeStatusHandle::new(BridgeStatus::default());
     let (devices, mut device_rx) = tokio::sync::mpsc::channel(1);
     let (releases, mut release_rx) = tokio::sync::mpsc::channel(1);
-    let reply = handle_request(req, &status, &devices, &Some(releases), &policy)
+    let reply = handle_request(req, &status, &devices, &Some(releases), &policy, &no_devices)
         .await
         .unwrap();
     assert_eq!(
@@ -185,7 +191,7 @@ async fn authorized_controls_reach_only_the_expected_channel() {
             bearer,
         );
         assert_eq!(
-            handle_request(req, &status, &devices, &releases, &policy(remote, token))
+            handle_request(req, &status, &devices, &releases, &policy(remote, token), &no_devices)
                 .await
                 .unwrap()
                 .status(),
@@ -200,7 +206,7 @@ async fn authorized_controls_reach_only_the_expected_channel() {
             bearer,
         );
         assert_eq!(
-            handle_request(req, &status, &devices, &releases, &policy(remote, token))
+            handle_request(req, &status, &devices, &releases, &policy(remote, token), &no_devices)
                 .await
                 .unwrap()
                 .status(),
@@ -227,6 +233,7 @@ async fn status_remains_read_only_without_authentication_and_does_not_disclose_t
             &devices,
             &Some(releases.clone()),
             &policy(true, Some("test-secret")),
+            &no_devices,
         )
         .await
         .unwrap();
@@ -336,6 +343,7 @@ async fn loopback_controller_without_origin_and_empty_json_body_can_release() {
         &devices,
         &Some(releases),
         &policy(false, None),
+        &no_devices,
     )
     .await
     .unwrap();
@@ -390,6 +398,7 @@ async fn controller_without_origin_still_needs_json_loopback_or_token() {
             &devices,
             &Some(releases),
             &policy(remote, Some("test-secret")),
+            &no_devices,
         )
         .await
         .unwrap();
@@ -421,7 +430,7 @@ async fn serve_on(addr: &str) -> (SocketAddr, tokio::sync::mpsc::Receiver<()>) {
     let (status, _reader) = BridgeStatusHandle::new(BridgeStatus::default());
     let (devices, _device_rx) = tokio::sync::mpsc::channel(1);
     let (releases, release_rx) = tokio::sync::mpsc::channel(4);
-    serve_web_ui(listener, status, devices, Some(releases), None);
+    serve_web_ui(listener, status, devices, Some(releases), None, Arc::new(no_devices));
     (local, release_rx)
 }
 

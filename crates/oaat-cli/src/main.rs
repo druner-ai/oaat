@@ -512,7 +512,7 @@ async fn run_endpoint(
             let list_devices: std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 #[cfg(target_os = "linux")]
                 {
-                    std::sync::Arc::new(|| AlsaDirectOutput::list_devices())
+                    std::sync::Arc::new(AlsaDirectOutput::list_devices)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -652,8 +652,17 @@ async fn run_endpoint(
     let alsa_mixer: Option<()> = None;
 
     // Graceful shutdown: listen for SIGTERM/SIGINT
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to register SIGTERM handler");
+    // (на Windows SIGTERM нет — вместо unix-сигнала future, который никогда не ready)
+    #[cfg(unix)]
+    let sigterm = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler")
+            .recv()
+            .await
+    };
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<Option<()>>();
+    tokio::pin!(sigterm);
     let sigint = tokio::signal::ctrl_c();
     tokio::pin!(sigint);
 
@@ -1271,17 +1280,16 @@ async fn run_endpoint(
                 info!(device = %new_device, "switching audio device via web UI");
                 current_audio_device = Some(new_device.clone());
                 // Live-reconfigure: пересоздать аудио-стрим на новом устройстве сразу.
-                if output_in_use {
-                    if let Some(fp) = &last_format {
-                        if let Err(e) = audio.configure_with_device(
-                            fp.format,
-                            fp.sample_rate,
-                            fp.channels,
-                            Some(&new_device),
-                        ) {
-                            error!(error = %e, "audio device switch failed");
-                        }
-                    }
+                let reconf = last_format.as_ref().filter(|_| output_in_use).map(|fp| {
+                    audio.configure_with_device(
+                        fp.format,
+                        fp.sample_rate,
+                        fp.channels,
+                        Some(&new_device),
+                    )
+                });
+                if let Some(Err(e)) = reconf {
+                    error!(error = %e, "audio device switch failed");
                 }
                 #[cfg(feature = "web-ui")]
                 status_handle.update(|s| {
@@ -1295,7 +1303,7 @@ async fn run_endpoint(
                 remove_pid_file();
                 break;
             }
-            _ = sigterm.recv() => {
+            _ = &mut sigterm => {
                 info!("Tune Bridge shutting down gracefully (SIGTERM)");
                 audio.stop();
                 let _ = mdns.shutdown();

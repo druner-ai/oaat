@@ -141,7 +141,7 @@ pub async fn start_web_ui_on(
         device_switch_tx,
         release_tx,
         None,
-        Arc::new(|| vec![]),
+        Arc::new(Vec::new),
     )
     .await;
 }
