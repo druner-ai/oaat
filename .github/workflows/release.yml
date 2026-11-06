@@ -22,16 +22,21 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            deb_arch: amd64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             cross: true
+            deb_arch: arm64
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -49,48 +54,79 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (native)
+      - name: Build tune-bridge (native)
         if: "!matrix.cross"
         run: cargo build --release -p oaat-cli --target ${{ matrix.target }}
 
-      - name: Build (cross)
+      - name: Build tune-bridge (cross)
         if: matrix.cross
         run: cross build --release -p oaat-cli --target ${{ matrix.target }}
+
+      # ts-controller — серверный контроллер SoundVault (Unix-сокет → только Linux)
+      - name: Build ts-controller (native)
+        if: runner.os == 'Linux' && !matrix.cross
+        run: cargo build --release -p ts-controller --target ${{ matrix.target }}
+
+      - name: Build ts-controller (cross)
+        if: matrix.cross
+        run: cross build --release -p ts-controller --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
+          RELDIR="target/${{ matrix.target }}/release"
+          EXE=""
+          if [ "${{ runner.os }}" = "Windows" ]; then EXE=".exe"; fi
           ARCHIVE="${BINARY_NAME}-${TAG}-${{ matrix.target }}.${{ matrix.archive }}"
-          # Version-less alias so `releases/latest/download/<STABLE>` always
-          # resolves to the newest release's asset. The versioned name (above)
-          # is baked into `latest/download/` URLs, so the moment a new tag ships
-          # the old versioned URL 404s (GitHub returns a 9-byte "Not Found" body
-          # that `curl -o` happily saves). Publishing this stable-named copy lets
-          # docs/install scripts pin a URL once and never break on a bump.
+          # Version-less alias: releases/latest/download/<STABLE> всегда указывает
+          # на свежий релиз — install-скрипты пинят URL один раз и не ломаются.
           ARCHIVE_STABLE="${BINARY_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
-          BIN="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          BIN="$RELDIR/${BINARY_NAME}${EXE}"
           if [ ! -f "$BIN" ]; then
-            echo "Binary not found at $BIN"
-            ls -la "target/${{ matrix.target }}/release/" | head -20
-            exit 1
+            echo "Binary not found at $BIN"; ls -la "$RELDIR" | head -20; exit 1
           fi
           strip "$BIN" 2>/dev/null || true
-          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" "$BINARY_NAME"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            tar -a -cf "$ARCHIVE" -C "$RELDIR" "${BINARY_NAME}.exe"
+          else
+            FILES="$BINARY_NAME"
+            if [ "${{ runner.os }}" = "Linux" ] && [ -f "$RELDIR/ts-controller" ]; then
+              strip "$RELDIR/ts-controller" 2>/dev/null || true
+              FILES="$FILES ts-controller"
+            fi
+            tar czf "$ARCHIVE" -C "$RELDIR" $FILES
           fi
           cp "$ARCHIVE" "$ARCHIVE_STABLE"
-          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
-          echo "ARCHIVE_STABLE=$ARCHIVE_STABLE" >> "$GITHUB_ENV"
-          ls -lh "$ARCHIVE" "$ARCHIVE_STABLE"
+          PACKAGES="$ARCHIVE"
+          PACKAGES_STABLE="$ARCHIVE_STABLE"
+          # .deb (Linux): tune-bridge + ts-controller + systemd-unit + конфиг-семпл
+          if [ -n "${{ matrix.deb_arch }}" ]; then
+            VER="${TAG#v}"
+            DEB="${BINARY_NAME}_${VER}_${{ matrix.deb_arch }}.deb"
+            DEB_STABLE="${BINARY_NAME}_latest_${{ matrix.deb_arch }}.deb"
+            ROOT=deb-root
+            mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/local/bin" "$ROOT/etc/systemd/system" "$ROOT/etc/oaat"
+            cp "$RELDIR/tune-bridge" "$ROOT/usr/local/bin/"
+            cp "$RELDIR/ts-controller" "$ROOT/usr/local/bin/"
+            printf 'Package: tune-bridge\nVersion: %s\nArchitecture: %s\nMaintainer: Andrei Tochenyi <druner@gmail.com>\nSection: sound\nPriority: optional\nDescription: OAAT audio endpoint + ts-controller (SoundVault fork)\n' "$VER" "${{ matrix.deb_arch }}" > "$ROOT/DEBIAN/control"
+            printf '[Unit]\nDescription=SoundVault OAAT Audio Endpoint\nAfter=network-online.target sound.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/tune-bridge endpoint --config /etc/oaat/endpoint.toml\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n' > "$ROOT/etc/systemd/system/oaat-endpoint.service"
+            printf '[endpoint]\nname = "my-endpoint"\nport = 9740\n\n[web_ui]\nenabled = true\nport = 9741\nbind = "0.0.0.0"\n# control_token = "<openssl rand -hex 16>"\n' > "$ROOT/etc/oaat/endpoint.toml.sample"
+            dpkg-deb --build "$ROOT" "$DEB"
+            cp "$DEB" "$DEB_STABLE"
+            PACKAGES="$PACKAGES $DEB"
+            PACKAGES_STABLE="$PACKAGES_STABLE $DEB_STABLE"
+          fi
+          ls -lh $PACKAGES $PACKAGES_STABLE
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: |
-            ${{ env.ARCHIVE }}
-            ${{ env.ARCHIVE_STABLE }}
+            tune-bridge-*.tar.gz
+            tune-bridge-*.zip
+            tune-bridge_*.deb
 
   release:
     needs: build

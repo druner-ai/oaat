@@ -135,7 +135,15 @@ pub async fn start_web_ui_on(
     device_switch_tx: DeviceSwitchTx,
     release_tx: Option<ReleaseTx>,
 ) {
-    start_web_ui_with_token(addr, status_handle, device_switch_tx, release_tx, None).await;
+    start_web_ui_with_token(
+        addr,
+        status_handle,
+        device_switch_tx,
+        release_tx,
+        None,
+        Arc::new(|| vec![]),
+    )
+    .await;
 }
 
 /// A shared token authenticates control requests, including on a LAN bind.
@@ -146,6 +154,7 @@ pub async fn start_web_ui_with_token(
     device_switch_tx: DeviceSwitchTx,
     release_tx: Option<ReleaseTx>,
     control_token: Option<String>,
+    list_devices: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) {
     let port = addr.port();
     let listener = match TcpListener::bind(addr).await {
@@ -167,6 +176,7 @@ pub async fn start_web_ui_with_token(
         device_switch_tx,
         release_tx,
         control_token,
+        list_devices,
     );
 }
 
@@ -177,6 +187,7 @@ fn serve_web_ui(
     device_switch_tx: DeviceSwitchTx,
     release_tx: Option<ReleaseTx>,
     control_token: Option<String>,
+    list_devices: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) {
     let status_handle = Arc::new(status_handle);
     let device_switch_tx = Arc::new(device_switch_tx);
@@ -204,6 +215,7 @@ fn serve_web_ui(
             let status = status_handle.clone();
             let switch_tx = device_switch_tx.clone();
             let release_tx = release_tx.clone();
+            let list_devices = list_devices.clone();
 
             tokio::spawn(async move {
                 let svc = service_fn(move |req| {
@@ -211,7 +223,10 @@ fn serve_web_ui(
                     let switch_tx = switch_tx.clone();
                     let release_tx = release_tx.clone();
                     let policy = policy.clone();
-                    async move { handle_request(req, &status, &switch_tx, &release_tx, &policy).await }
+                    let list_devices = list_devices.clone();
+                    async move {
+                        handle_request(req, &status, &switch_tx, &release_tx, &policy, &*list_devices).await
+                    }
                 });
                 if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                     // Connection reset is normal for browsers
@@ -318,6 +333,7 @@ async fn handle_request<B>(
     device_switch_tx: &DeviceSwitchTx,
     release_tx: &Option<ReleaseTx>,
     policy: &ControlPolicy,
+    list_devices: &(dyn Fn() -> Vec<String> + Send + Sync),
 ) -> Result<Response<Full<Bytes>>, hyper::Error>
 where
     B: hyper::body::Body<Data = Bytes>,
@@ -359,6 +375,20 @@ where
                 .status(200)
                 .header("Content-Type", "text/html; charset=utf-8")
                 .body(Full::new(Bytes::from(html)))
+                .unwrap())
+        }
+        (&Method::GET, "/api/devices") => {
+            let devs = list_devices();
+            let arr = devs
+                .iter()
+                .map(|d| format!(r#""{}""#, d.replace('"', r#"\""#)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let json = format!(r#"{{"devices":[{}]}}"#, arr);
+            Ok(Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(json)))
                 .unwrap())
         }
         (&Method::GET, "/api/status") => {

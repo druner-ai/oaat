@@ -509,12 +509,23 @@ async fn run_endpoint(
         let (handle, _reader) = web_ui::BridgeStatusHandle::new(initial_status);
         let (switch_tx, switch_rx) = mpsc::channel::<String>(8);
         if web_ui_enabled {
+            let list_devices: std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                #[cfg(target_os = "linux")]
+                {
+                    std::sync::Arc::new(|| AlsaDirectOutput::list_devices())
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    std::sync::Arc::new(|| CpalOutput::list_devices())
+                }
+            };
             web_ui::start_web_ui_with_token(
                 web_ui_addr,
                 handle.clone(),
                 switch_tx,
                 Some(release_tx.clone()),
                 web_control_token,
+                list_devices,
             )
             .await;
         }
@@ -1259,6 +1270,19 @@ async fn run_endpoint(
             Some(new_device) = device_switch_rx.recv() => {
                 info!(device = %new_device, "switching audio device via web UI");
                 current_audio_device = Some(new_device.clone());
+                // Live-reconfigure: пересоздать аудио-стрим на новом устройстве сразу.
+                if output_in_use {
+                    if let Some(fp) = &last_format {
+                        if let Err(e) = audio.configure_with_device(
+                            fp.format,
+                            fp.sample_rate,
+                            fp.channels,
+                            Some(&new_device),
+                        ) {
+                            error!(error = %e, "audio device switch failed");
+                        }
+                    }
+                }
                 #[cfg(feature = "web-ui")]
                 status_handle.update(|s| {
                     s.current_device = new_device;
