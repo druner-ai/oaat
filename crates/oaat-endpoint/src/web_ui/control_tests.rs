@@ -71,7 +71,7 @@ async fn rejected(req: Request<Full<Bytes>>, policy: ControlPolicy, expected: St
 
 #[tokio::test]
 async fn cross_origin_and_rebinding_requests_never_control_the_output() {
-    for path in ["/api/device", "/api/release"] {
+    for path in ["/api/device", "/api/release", "/api/update"] {
         for origin in [
             Some("null"),
             Some("http://evil.example"),
@@ -107,7 +107,7 @@ async fn cross_origin_and_rebinding_requests_never_control_the_output() {
 
 #[tokio::test]
 async fn controls_require_json_content_type() {
-    for path in ["/api/device", "/api/release"] {
+    for path in ["/api/device", "/api/release", "/api/update"] {
         for mime in [
             None,
             Some("text/plain"),
@@ -125,7 +125,7 @@ async fn controls_require_json_content_type() {
 
 #[tokio::test]
 async fn remote_controls_are_denied_without_a_configured_token() {
-    for path in ["/api/device", "/api/release"] {
+    for path in ["/api/device", "/api/release", "/api/update"] {
         rejected(
             request(
                 path,
@@ -143,7 +143,7 @@ async fn remote_controls_are_denied_without_a_configured_token() {
 #[tokio::test]
 async fn configured_token_is_required_locally_and_remotely_and_cannot_be_empty() {
     for remote in [false, true] {
-        for path in ["/api/device", "/api/release"] {
+        for path in ["/api/device", "/api/release", "/api/update"] {
             for bearer in [None, Some("Bearer wrong"), Some("Bearer test-secret-wrong")] {
                 rejected(
                     request(
@@ -264,7 +264,7 @@ fn matching_ipv6_and_localhost_origins_are_supported() {
 
 #[tokio::test]
 async fn a_valid_token_does_not_bypass_origin_or_json_checks() {
-    for path in ["/api/device", "/api/release"] {
+    for path in ["/api/device", "/api/release", "/api/update"] {
         rejected(
             request(
                 path,
@@ -354,7 +354,7 @@ async fn loopback_controller_without_origin_and_empty_json_body_can_release() {
 
 #[tokio::test]
 async fn controller_without_origin_still_needs_json_loopback_or_token() {
-    for path in ["/api/device", "/api/release"] {
+    for path in ["/api/device", "/api/release", "/api/update"] {
         for mime in [
             None,
             Some("text/plain"),
@@ -516,4 +516,34 @@ async fn loopback_listener_is_unreachable_from_another_interface() {
         tokio::net::TcpStream::connect(other).await.is_err(),
         "loopback-bound controls reachable on {other}"
     );
+}
+
+#[tokio::test]
+async fn update_rejects_invalid_payload_without_touching_the_binary() {
+    // валидная авторизация (loopback + токен), но тело не проходит проверку —
+    // handler обязан вернуть 400 ДО каких-либо операций с current_exe()
+    let policy = policy(false, Some("tok"));
+    for body in [
+        r#"{"b64":"eA=="}"#,        // декодируется в 1 байт — слишком мало
+        r#"{"b64":"!!not-base64!!"}"#, // невалидный base64
+        r#"{"device":"x"}"#,         // нет поля b64
+    ] {
+        let (status, _reader) = BridgeStatusHandle::new(BridgeStatus::default());
+        let (devices, _device_rx) = tokio::sync::mpsc::channel(1);
+        let (releases, _release_rx) = tokio::sync::mpsc::channel(1);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/update")
+            .header("host", "127.0.0.1:9741")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer tok")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap();
+        let reply = handle_request(
+            req, &status, &devices, &Some(releases), &policy, &no_devices,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status(), 400, "payload {body} was accepted");
+    }
 }

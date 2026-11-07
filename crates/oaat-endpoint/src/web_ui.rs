@@ -350,7 +350,7 @@ where
     if req.method() == Method::POST
         && matches!(
             req.uri().path(),
-            "/api/device" | "/api/release" | "/api/token/regenerate"
+            "/api/device" | "/api/release" | "/api/token/regenerate" | "/api/update"
         )
         && let Err(code) = policy.authorize(&req)
     {
@@ -476,6 +476,86 @@ where
                     .unwrap()),
             }
         }
+        (&Method::POST, "/api/update") => {
+            // OTA (P2.10): тело — JSON {"b64": "<новый tune-bridge в base64>"}
+            // (сервер SoundVault сам качает бинарь из GitHub-релизов; токен на
+            // endpoint не передаётся, а JSON-обязательство ControlPolicy остаётся
+            // нетронутым). Пишем временный файл рядом с текущим exe, переименовываем
+            // запущенный в .old, новый — на его место и выходим: супервизор
+            // (systemd/LaunchAgent) перезапускает процесс уже новой версией.
+            use base64::Engine;
+            use http_body_util::BodyExt;
+            let body = req
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let bad = |err: &str| {
+                Response::builder()
+                    .status(400)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(
+                        serde_json::json!({"ok": false, "error": err}).to_string(),
+                    )))
+                    .unwrap()
+            };
+            let Some(b64) = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("b64")?.as_str().map(str::to_owned))
+            else {
+                return Ok(bad(r#"expected {"b64": "..."}"#));
+            };
+            let Ok(bin) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+                return Ok(bad("invalid base64"));
+            };
+            if bin.len() < 1024 {
+                return Ok(bad("payload too small"));
+            }
+            let result = (|| -> Result<(), String> {
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let dir = exe.parent().ok_or("no exe dir")?;
+                let tmp = dir.join("tune-bridge.update.tmp");
+                std::fs::write(&tmp, &bin).map_err(|e| e.to_string())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| e.to_string())?;
+                }
+                let old = dir.join("tune-bridge.old");
+                let _ = std::fs::remove_file(&old);
+                // rename запущенного exe работает и на unix, и на Windows
+                std::fs::rename(&exe, &old).map_err(|e| e.to_string())?;
+                if let Err(e) = std::fs::rename(&tmp, &exe) {
+                    let _ = std::fs::rename(&old, &exe); // rollback
+                    return Err(e.to_string());
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    info!("web UI: binary updated, restarting");
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        std::process::exit(0);
+                    });
+                    Ok(Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from_static(
+                            b"{\"ok\":true,\"restarting\":true}",
+                        )))
+                        .unwrap())
+                }
+                Err(e) => Ok(Response::builder()
+                    .status(500)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(
+                        serde_json::json!({"ok": false, "error": e}).to_string(),
+                    )))
+                    .unwrap()),
+            }
+        }
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("Not Found")))
@@ -497,9 +577,11 @@ fn render_status_json(status: &BridgeStatus) -> String {
         .map(|d| format!(r#""{}""#, d.replace('"', r#"\""#)))
         .collect();
     format!(
-        r#"{{"bridge_name":"{}","version":"{}","current_device":"{}","available_devices":[{}],"connected":{},"controller_name":{},"playing":{},"volume":{},"track_title":{},"track_artist":{},"track_album":{},"artwork_url":{},"stream_format":{},"stream_sample_rate":{},"stream_bits":{},"stream_channels":{}}}"#,
+        r#"{{"bridge_name":"{}","version":"{}","os":"{}","arch":"{}","current_device":"{}","available_devices":[{}],"connected":{},"controller_name":{},"playing":{},"volume":{},"track_title":{},"track_artist":{},"track_album":{},"artwork_url":{},"stream_format":{},"stream_sample_rate":{},"stream_bits":{},"stream_channels":{}}}"#,
         status.bridge_name.replace('"', r#"\""#),
         status.version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
         status.current_device.replace('"', r#"\""#),
         devices_json.join(","),
         status.connected,
