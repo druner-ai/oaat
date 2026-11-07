@@ -91,7 +91,9 @@ jobs:
             cp dist/windows/install.ps1 "$RELDIR/"
             # В Git Bash на windows-runner tar = msys GNU tar: нет ни --format zip,
             # ни переключения контейнера через -a. Нативный Compress-Archive надёжен.
-            powershell.exe -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$RELDIR")\*' -DestinationPath '$(cygpath -w "$ARCHIVE")' -Force"
+            # ВАЖНО: перечислять файлы явно — RELDIR это target/<triple>/release,
+            # wildcard <RELDIR>\* затянет все build-артефакты (deps/, .pdb, .d, ~450MB).
+            powershell.exe -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$RELDIR/${BINARY_NAME}.exe")','$(cygpath -w "$RELDIR/install.ps1")' -DestinationPath '$(cygpath -w "$ARCHIVE")' -Force"
           else
             FILES="$BINARY_NAME"
             if [ "${{ runner.os }}" = "Linux" ] && [ -f "$RELDIR/ts-controller" ]; then
