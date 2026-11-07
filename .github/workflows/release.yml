@@ -89,7 +89,8 @@ jobs:
           strip "$BIN" 2>/dev/null || true
           if [ "${{ matrix.archive }}" = "zip" ]; then
             cp dist/windows/install.ps1 "$RELDIR/"
-            tar -a -cf "$ARCHIVE" -C "$RELDIR" "${BINARY_NAME}.exe" install.ps1
+            # bsdtar на Windows: -a НЕ переключает контейнер на zip — формат явно
+            tar --format zip -cf "$ARCHIVE" -C "$RELDIR" "${BINARY_NAME}.exe" install.ps1
           else
             FILES="$BINARY_NAME"
             if [ "${{ runner.os }}" = "Linux" ] && [ -f "$RELDIR/ts-controller" ]; then
