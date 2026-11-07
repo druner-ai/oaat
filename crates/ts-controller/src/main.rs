@@ -75,6 +75,7 @@ struct Track {
 
 struct Player {
     track: Option<Track>,
+    meta: Option<TrackMetadata>, // последние метаданные — для re-arm при seek
     sample_offset: u64,    // следующий sample для ЧТЕНИЯ из файла
     base_offset: u64,      // сэмпл, с которого начинается текущий поток (для заголовка/PTS)
     playing: bool,         // стримим (не paused, не stopped)
@@ -162,12 +163,30 @@ fn elapsed_ns(p: &Player) -> u64 {
     p.base_elapsed_ns + p.stream_start.elapsed().as_nanos() as u64
 }
 
+/// JSON-ответ с ошибкой; экранирует кавычки (сетевые ошибки содержат произвольный текст).
+fn json_err(msg: &str) -> String {
+    format!("{{\"ok\":false,\"error\":\"{}\"}}", msg.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Подключение к endpoint'у с бесконечными ретраями (стартовое И переподключение).
+async fn connect_with_retry(config: &ControllerConfig, target: SocketAddr) -> ConnectedEndpoint {
+    loop {
+        match ConnectedEndpoint::connect(config, target).await {
+            Ok(ep) => return ep,
+            Err(e) => {
+                warn!("не подключиться к {target}: {e}; повтор через 5с");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
 async fn handle(ep: &mut ConnectedEndpoint, p: &mut Player, cmd: Command) -> String {
     match cmd {
         Command::Play { path, title, artist, album } => match parse_wav(&path) {
             Err(e) => format!("{{\"ok\":false,\"error\":\"{e}\"}}"),
             Ok(track) => {
-                let _ = ep
+                if let Err(e) = ep
                     .propose_format(
                         STREAM_ID,
                         track.format,
@@ -176,20 +195,25 @@ async fn handle(ep: &mut ConnectedEndpoint, p: &mut Player, cmd: Command) -> Str
                         ChannelLayout::Stereo,
                         track.bits,
                     )
-                    .await;
-                let _ = ep
-                    .send_metadata(TrackMetadata {
-                        title: title.unwrap_or_else(|| stem(&path)),
-                        artist: artist.unwrap_or_default(),
-                        album: album.unwrap_or_default(),
-                        duration_ms: (track.duration_s * 1000.0) as u64,
-                        artwork_url: None,
-                        format: Some(format!("PCM {}/{}", track.bits, track.sample_rate / 1000)),
-                    })
-                    .await;
-                let _ = ep.send_play(STREAM_ID).await;
+                    .await
+                {
+                    return json_err(&format!("endpoint недоступен: {e}"));
+                }
+                let meta = TrackMetadata {
+                    title: title.unwrap_or_else(|| stem(&path)),
+                    artist: artist.unwrap_or_default(),
+                    album: album.unwrap_or_default(),
+                    duration_ms: (track.duration_s * 1000.0) as u64,
+                    artwork_url: None,
+                    format: Some(format!("PCM {}/{}", track.bits, track.sample_rate / 1000)),
+                };
+                let _ = ep.send_metadata(meta.clone()).await;
+                if let Err(e) = ep.send_play(STREAM_ID).await {
+                    return json_err(&format!("endpoint недоступен: {e}"));
+                }
                 let dur = track.duration_s;
                 p.track = Some(track);
+                p.meta = Some(meta);
                 p.sample_offset = 0;
                 p.base_offset = 0;
                 p.playing = true;
@@ -232,13 +256,26 @@ async fn handle(ep: &mut ConnectedEndpoint, p: &mut Player, cmd: Command) -> Str
             let Some(t) = &p.track else {
                 return "{\"ok\":false,\"error\":\"нет трека\"}".into();
             };
-            let sec = sec.clamp(0.0, t.duration_s);
+            let (fmt, rate, ch, bits, dur_s) =
+                (t.format, t.sample_rate, t.channels, t.bits, t.duration_s);
+            let sec = sec.clamp(0.0, dur_s);
             // endpoint (MacBook) не перематывает по Seek-сообщению надёжно →
-            // перезапускаем поток с пропущенными сэмплами: stop сбрасывает
-            // endpoint-состояние, play re-arms, а следующие аудио-пакеты уже
-            // начинаются с нужного sample_offset (звук с позиции sec без ffmpeg).
+            // перезапускаем поток с пропущенными сэмплами. ВАЖНО (macOS/Cpal):
+            // stop разрушает выходной стрим, и Play без нового propose_format —
+            // тихий no-op (пакеты идут, buf=0, звука нет). Поэтому полный
+            // re-arm: stop → propose → metadata → play, как при свежем
+            // воспроизведении. Для ALSA (NUC) повторный propose безвреден.
             let _ = ep.send_stop(STREAM_ID).await;
-            p.sample_offset = (sec * t.sample_rate as f64) as u64;
+            if let Err(e) = ep
+                .propose_format(STREAM_ID, fmt, rate, ch, ChannelLayout::Stereo, bits)
+                .await
+            {
+                return json_err(&format!("endpoint недоступен: {e}"));
+            }
+            if let Some(m) = &p.meta {
+                let _ = ep.send_metadata(m.clone()).await;
+            }
+            p.sample_offset = (sec * rate as f64) as u64;
             // новый поток начинается здесь: заголовок/PTS идут с 0 (rel = 0),
             // а данные читаются с sample_offset (пропущенные сэмплы = позиция sec).
             p.base_offset = p.sample_offset;
@@ -337,9 +374,12 @@ async fn stream_loop(
     mut ep: ConnectedEndpoint,
     mut cmd_rx: mpsc::Receiver<Command>,
     resp_tx: mpsc::Sender<String>,
+    config: ControllerConfig,
+    target: SocketAddr,
 ) {
     let mut p = Player {
         track: None,
+        meta: None,
         sample_offset: 0,
         base_offset: 0,
         playing: false,
@@ -350,6 +390,15 @@ async fn stream_loop(
     };
 
     loop {
+        // endpoint перезапустился (TCP умер): переподключаемся ДО обработки
+        // команды, иначе play «пройдёт успешно» в никуда (backend покажет
+        // playing, звука нет). Старый поток нежизнеспособен — честный paused.
+        if !ep.is_reader_alive() {
+            warn!("соединение с endpoint потеряно — переподключение к {target}");
+            ep = connect_with_retry(&config, target).await;
+            let _ = ep.clock_sync_bootstrap().await;
+            p.playing = false;
+        }
         if p.playing && p.track.is_some() {
             let t = p.track.as_ref().unwrap();
             let expected =
@@ -372,12 +421,18 @@ async fn stream_loop(
                 }
             }
         } else {
-            match cmd_rx.recv().await {
-                Some(c) => {
-                    let resp = handle(&mut ep, &mut p, c).await;
-                    let _ = resp_tx.send(resp).await;
-                }
-                None => break,
+            // тик 5с: даже без команд регулярно возвращаемся наверх цикла
+            // для проверки живости — endpoint может перезапуститься в простое,
+            // переподключение должно происходить без внешней команды.
+            tokio::select! {
+                c = cmd_rx.recv() => match c {
+                    Some(c) => {
+                        let resp = handle(&mut ep, &mut p, c).await;
+                        let _ = resp_tx.send(resp).await;
+                    }
+                    None => break,
+                },
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
             }
         }
     }
@@ -415,15 +470,7 @@ async fn main() {
         clock_port,
         tls: false,
     };
-    let mut ep = loop {
-        match ConnectedEndpoint::connect(&config, args.target).await {
-            Ok(ep) => break ep,
-            Err(e) => {
-                eprintln!("не подключиться к {}: {e}; повтор через 5с", args.target);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
+    let mut ep = connect_with_retry(&config, args.target).await;
     info!(target = %args.target, endpoint = %ep.info.endpoint_name, "подключён");
     if let Err(e) = ep.clock_sync_bootstrap().await {
         warn!("clock sync failed: {e}");
@@ -442,7 +489,7 @@ async fn main() {
     let (resp_tx, resp_rx) = mpsc::channel::<String>(64);
 
     tokio::spawn(async move {
-        stream_loop(ep, cmd_rx, resp_tx).await;
+        stream_loop(ep, cmd_rx, resp_tx, config, args.target).await;
     });
 
     info!(socket = %args.socket, "слушаю команды");
