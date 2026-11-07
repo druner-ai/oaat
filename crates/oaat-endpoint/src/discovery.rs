@@ -14,6 +14,9 @@ pub struct EndpointAnnouncement {
     pub model: Option<String>,
     pub vendor: Option<String>,
     pub firmware: Option<String>,
+    /// Auto-generated control_token: публикуется в mDNS TXT, чтобы backend
+    /// подхватил его без ручной настройки (P1.5 «безопасность из коробки»).
+    pub control_token: Option<String>,
 }
 
 fn detect_local_ip() -> Ipv4Addr {
@@ -69,6 +72,9 @@ impl EndpointAnnouncement {
         }
         if let Some(ref fw) = self.firmware {
             props.push(("fw", fw));
+        }
+        if let Some(ref token) = self.control_token {
+            props.push(("token", token));
         }
 
         let service = ServiceInfo::new(

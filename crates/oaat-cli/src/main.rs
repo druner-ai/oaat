@@ -197,6 +197,46 @@ fn daemonize() {
     }
 }
 
+/// State-файл токена: `<config>.token` рядом с конфигом либо
+/// `~/.tune-bridge.token`, если endpoint запущен без `--config`.
+fn token_state_path(config: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = config {
+        let mut t = std::ffi::OsString::from(p);
+        t.push(".token");
+        return std::path::PathBuf::from(t);
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".tune-bridge.token")
+}
+
+/// Токен из state-файла; если его нет — генерируем (uuid v4, 32 hex),
+/// сохраняем (0600 на unix) и возвращаем. «Безопасность из коробки»:
+/// ручной `openssl rand -hex` больше не нужен.
+fn load_or_create_token(path: &std::path::Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let t = existing.trim();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    match std::fs::write(path, &token) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            info!(path = %path.display(), "auto-generated control_token (state file)");
+        }
+        Err(e) => warn!(error = %e, "failed to persist control_token; using ephemeral"),
+    }
+    token
+}
+
 async fn run(cli: Cli) {
     match cli.command {
         Command::Endpoint {
@@ -257,6 +297,24 @@ async fn run(cli: Cli) {
                 std::process::exit(1);
             });
 
+            // P1.5: control_token — config > state-файл > автогенерация.
+            // Авто-токен публикуется в mDNS TXT для автоподхвата backend'ом
+            // (config-токен — секрет пользователя, в TXT не светится);
+            // state-файл нужен и для регенерации через POST /api/token/regenerate.
+            let ep_token_file = token_state_path(config.as_deref());
+            let mut token_auto = false;
+            let ep_control_token = file_config
+                .web_ui
+                .control_token
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| {
+                    #[cfg(feature = "web-ui")]
+                    oaat_endpoint::web_ui::set_token_file(ep_token_file.clone());
+                    token_auto = true;
+                    Some(load_or_create_token(&ep_token_file))
+                });
+
             // CLI args override config file values
             let ep_name = name.unwrap_or_else(|| {
                 let cfg_name = &file_config.endpoint.name;
@@ -296,7 +354,8 @@ async fn run(cli: Cli) {
                 &file_config.hooks,
                 ep_web_ui,
                 ep_web_addr,
-                file_config.web_ui.control_token.clone(),
+                ep_control_token,
+                token_auto,
                 ep_dsd,
             )
             .await;
@@ -368,6 +427,7 @@ async fn run_endpoint(
     web_ui_enabled: bool,
     web_ui_addr: SocketAddr,
     web_control_token: Option<String>,
+    token_auto: bool,
     enable_dsd: bool,
 ) {
     let web_ui_port = web_ui_addr.port();
@@ -472,6 +532,8 @@ async fn run_endpoint(
         model: None,
         vendor: Some("MozAIk Labs".into()),
         firmware: Some(env!("CARGO_PKG_VERSION").into()),
+        // только авто-сгенерированный токен: config-токен в multicast не светим
+        control_token: token_auto.then(|| web_control_token.clone()).flatten(),
     };
     if let Err(e) = announcement.register(&mdns) {
         warn!(error = %e, "mDNS registration failed, continuing without discovery");

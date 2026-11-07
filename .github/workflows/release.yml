@@ -88,12 +88,18 @@ jobs:
           fi
           strip "$BIN" 2>/dev/null || true
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            tar -a -cf "$ARCHIVE" -C "$RELDIR" "${BINARY_NAME}.exe"
+            cp dist/windows/install.ps1 "$RELDIR/"
+            tar -a -cf "$ARCHIVE" -C "$RELDIR" "${BINARY_NAME}.exe" install.ps1
           else
             FILES="$BINARY_NAME"
             if [ "${{ runner.os }}" = "Linux" ] && [ -f "$RELDIR/ts-controller" ]; then
               strip "$RELDIR/ts-controller" 2>/dev/null || true
               FILES="$FILES ts-controller"
+            fi
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              cp dist/macos/install.sh dist/macos/com.oaat.endpoint.plist.template "$RELDIR/"
+              chmod +x "$RELDIR/install.sh"
+              FILES="$FILES install.sh com.oaat.endpoint.plist.template"
             fi
             tar czf "$ARCHIVE" -C "$RELDIR" $FILES
           fi
@@ -111,7 +117,10 @@ jobs:
             cp "$RELDIR/ts-controller" "$ROOT/usr/local/bin/"
             printf 'Package: tune-bridge\nVersion: %s\nArchitecture: %s\nMaintainer: Andrei Tochenyi <druner@gmail.com>\nSection: sound\nPriority: optional\nDescription: OAAT audio endpoint + ts-controller (SoundVault fork)\n' "$VER" "${{ matrix.deb_arch }}" > "$ROOT/DEBIAN/control"
             printf '[Unit]\nDescription=SoundVault OAAT Audio Endpoint\nAfter=network-online.target sound.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/tune-bridge endpoint --config /etc/oaat/endpoint.toml\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n' > "$ROOT/etc/systemd/system/oaat-endpoint.service"
-            printf '[endpoint]\nname = "my-endpoint"\nport = 9740\n\n[web_ui]\nenabled = true\nport = 9741\nbind = "0.0.0.0"\n# control_token = "<openssl rand -hex 16>"\n' > "$ROOT/etc/oaat/endpoint.toml.sample"
+            printf '[endpoint]\nname = "my-endpoint"\nport = 9740\n\n[web_ui]\nenabled = true\nport = 9741\nbind = "0.0.0.0"\n# control_token генерируется автоматически при первом запуске\n# (файл /etc/oaat/endpoint.toml.token) и подхватывается сервером\n# SoundVault через mDNS TXT — вручную задавать не нужно.\n' > "$ROOT/etc/oaat/endpoint.toml.sample"
+            printf '#!/bin/sh\nset -e\nif [ -d /run/systemd/system ]; then\n  systemctl daemon-reload\n  if [ ! -f /etc/oaat/endpoint.toml ] && [ -f /etc/oaat/endpoint.toml.sample ]; then\n    cp /etc/oaat/endpoint.toml.sample /etc/oaat/endpoint.toml\n  fi\n  systemctl enable oaat-endpoint.service\n  systemctl restart oaat-endpoint.service || true\nfi\n' > "$ROOT/DEBIAN/postinst"
+            printf '#!/bin/sh\nset -e\nif [ -d /run/systemd/system ]; then\n  systemctl stop oaat-endpoint.service || true\n  systemctl disable oaat-endpoint.service || true\nfi\n' > "$ROOT/DEBIAN/prerm"
+            chmod 755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/prerm"
             dpkg-deb --build "$ROOT" "$DEB"
             cp "$DEB" "$DEB_STABLE"
             PACKAGES="$PACKAGES $DEB"

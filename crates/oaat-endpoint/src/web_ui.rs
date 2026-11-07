@@ -105,6 +105,15 @@ pub struct BridgeStatusReader {
 pub type DeviceSwitchTx = tokio::sync::mpsc::Sender<String>;
 pub type DeviceSwitchRx = tokio::sync::mpsc::Receiver<String>;
 
+/// State-файл авто-сгенерированного control_token. Устанавливается CLI при
+/// старте; если не установлен — токен задан конфигом и регенерация через
+/// `POST /api/token/regenerate` недоступна (409).
+static TOKEN_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_token_file(path: std::path::PathBuf) {
+    let _ = TOKEN_FILE.set(path);
+}
+
 /// Channel for release requests (`POST /api/release`) from the web UI to the
 /// main loop.
 pub type ReleaseTx = tokio::sync::mpsc::Sender<()>;
@@ -339,7 +348,10 @@ where
     B: hyper::body::Body<Data = Bytes>,
 {
     if req.method() == Method::POST
-        && matches!(req.uri().path(), "/api/device" | "/api/release")
+        && matches!(
+            req.uri().path(),
+            "/api/device" | "/api/release" | "/api/token/regenerate"
+        )
         && let Err(code) = policy.authorize(&req)
     {
         return Ok(Response::builder()
@@ -366,6 +378,37 @@ where
                 .status(code)
                 .header("Content-Type", "application/json")
                 .body(Full::new(Bytes::from(body)))
+                .unwrap())
+        }
+        (&Method::POST, "/api/token/regenerate") => {
+            // Регенерация авто-сгенерированного токена: удаляем state-файл и
+            // выходим — супервизор (systemd/LaunchAgent) перезапустит процесс,
+            // тот сгенерирует новый токен и опубликует его в mDNS TXT.
+            let Some(path) = TOKEN_FILE.get() else {
+                return Ok(Response::builder()
+                    .status(409)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from_static(
+                        b"{\"ok\":false,\"error\":\"token is set via config, regenerate unavailable\"}",
+                    )))
+                    .unwrap());
+            };
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(error = %e, "failed to remove token state file");
+            }
+            info!("control_token regenerate requested; restarting endpoint");
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::process::exit(0);
+            });
+            Ok(Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from_static(
+                    b"{\"ok\":true,\"restart\":true}",
+                )))
                 .unwrap())
         }
         (&Method::GET, "/") | (&Method::GET, "/index.html") => {
