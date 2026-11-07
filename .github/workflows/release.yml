@@ -89,8 +89,9 @@ jobs:
           strip "$BIN" 2>/dev/null || true
           if [ "${{ matrix.archive }}" = "zip" ]; then
             cp dist/windows/install.ps1 "$RELDIR/"
-            # bsdtar на Windows: -a НЕ переключает контейнер на zip — формат явно
-            tar --format zip -cf "$ARCHIVE" -C "$RELDIR" "${BINARY_NAME}.exe" install.ps1
+            # В Git Bash на windows-runner tar = msys GNU tar: нет ни --format zip,
+            # ни переключения контейнера через -a. Нативный Compress-Archive надёжен.
+            powershell.exe -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$RELDIR")\*' -DestinationPath '$(cygpath -w "$ARCHIVE")' -Force"
           else
             FILES="$BINARY_NAME"
             if [ "${{ runner.os }}" = "Linux" ] && [ -f "$RELDIR/ts-controller" ]; then
