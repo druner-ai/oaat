@@ -16,8 +16,10 @@ permissions:
 
 jobs:
   pi-image:
-    # pin: не latest — cutover раннера не должен ломать libguestfs-сборку
-    runs-on: ubuntu-24.04
+    # ARM64-раннер: гость aarch64, --run-command работает нативно
+    # (на x86_64 libguestfs не даёт выполнять команды в arm-госте).
+    # Пин: не latest — cutover раннера не должен ломать сборку.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
