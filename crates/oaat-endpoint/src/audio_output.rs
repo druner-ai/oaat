@@ -177,6 +177,11 @@ pub struct CpalOutput {
     /// them on every configure() eats the PTS scheduling lead time.
     /// `prewarm()` fills this at startup.
     cached_device: Option<(Option<String>, cpal::Device, DeviceSampleSupport)>,
+    /// Set by the stream error callback when cpal reports the output device
+    /// gone (sleep/wake, unplugged DAC: "The requested device is no longer
+    /// available"). `recover_if_lost()` drops the dead stream + stale device
+    /// cache and reopens the output with the last configured format.
+    device_lost: Arc<AtomicBool>,
     #[cfg(feature = "flac")]
     flac_stream: Option<crate::flac_decoder::FlacStreamDecoder>,
 }
@@ -238,6 +243,7 @@ impl CpalOutput {
             bit_perfect: Arc::new(AtomicU8::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
             cached_device: None,
+            device_lost: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "flac")]
             flac_stream: None,
         }
@@ -303,9 +309,41 @@ impl CpalOutput {
         Ok((device, support))
     }
 
+    /// Восстановление после пропажи выходного устройства (сон/пробуждение,
+    /// отключили DAC): cpal-shutdown поток и устаревший HAL-кэш сбрасываются,
+    /// выход переоткрывается с последним настроенным форматом.
+    /// Вызывается из prewarm/configure/write_audio.
+    fn recover_if_lost(&mut self) -> bool {
+        if !self.device_lost.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        warn!("audio device lost — reopening output");
+        let was_playing = self.playing.load(Ordering::Relaxed);
+        self.stream = None;
+        self.producer = None;
+        self.cached_device = None;
+        if self.sample_rate > 0 {
+            let dev = self.device_name.clone();
+            if let Err(e) = self.configure_with_device(
+                self.format,
+                self.sample_rate,
+                self.channels,
+                dev.as_deref(),
+            ) {
+                warn!(error = %e, "reopen after device loss failed");
+                return true;
+            }
+            if was_playing {
+                self.play();
+            }
+        }
+        true
+    }
+
     /// Pre-resolve and cache the output device so the first configure()
     /// does not pay the enumeration cost during stream setup.
     pub fn prewarm(&mut self, device_name: Option<&str>) {
+        self.recover_if_lost();
         let started = std::time::Instant::now();
         match self.resolve_device(device_name) {
             Ok((d, support)) => info!(
@@ -334,6 +372,7 @@ impl CpalOutput {
         channels: u8,
         device_name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.recover_if_lost();
         self.stop();
         self.format = format;
         self.sample_rate = sample_rate;
@@ -420,6 +459,9 @@ impl CpalOutput {
         // Scratch buffer allocated once, outside the callback: a heap
         // allocation inside the real-time audio callback risks glitches.
         let mut scratch: Vec<u8> = vec![0u8; 16384 * bps];
+        // Флаг пропажи устройства: error-callback его взводит, а
+        // recover_if_lost() по нему переоткрывает выход (сон/отключение DAC).
+        let lost_flag = self.device_lost.clone();
 
         macro_rules! build_stream {
             ($sample:ty, $convert:expr) => {{
@@ -448,7 +490,13 @@ impl CpalOutput {
                             };
                         }
                     },
-                    |err| error!(error = %err, "audio output error"),
+                    {
+                        let lost = lost_flag.clone();
+                        move |err| {
+                            error!(error = %err, "audio output error");
+                            lost.store(true, Ordering::Relaxed);
+                        }
+                    },
                     None,
                 )?
             }};
@@ -566,6 +614,7 @@ impl CpalOutput {
     /// Write audio payload bytes (in the negotiated wire format) to the ring.
     /// Returns the number of frames enqueued.
     pub fn write_audio(&mut self, data: &[u8]) -> usize {
+        self.recover_if_lost();
         let Some(producer) = self.producer.as_mut() else {
             return 0;
         };

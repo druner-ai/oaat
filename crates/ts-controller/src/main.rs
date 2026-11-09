@@ -6,7 +6,9 @@
 //! volume / status. Пауза, перемотка и громкость идут нативными сообщениями
 //! протокола OAAT (Pause/Seek/VolumeSet), без SIGSTOP/SIGCONT/перезапусков.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -169,15 +171,38 @@ fn json_err(msg: &str) -> String {
 }
 
 /// Подключение к endpoint'у с бесконечными ретраями (стартовое И переподключение).
+/// Каждая попытка ограничена 10с: зависший handshake (endpoint проснулся не
+/// полностью) не должен блокировать ретраи навсегда.
 async fn connect_with_retry(config: &ControllerConfig, target: SocketAddr) -> ConnectedEndpoint {
     loop {
-        match ConnectedEndpoint::connect(config, target).await {
-            Ok(ep) => return ep,
-            Err(e) => {
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            ConnectedEndpoint::connect(config, target),
+        )
+        .await
+        {
+            Ok(Ok(ep)) => return ep,
+            Ok(Err(e)) => {
                 warn!("не подключиться к {target}: {e}; повтор через 5с");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(_) => {
+                warn!("подключение к {target} не завершилось за 10с (handshake завис?); повтор через 5с");
             }
         }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Ответ на команду, пока endpoint не подключён: статус честно сообщает
+/// «connecting», остальные команды — внятная ошибка (а не ConnectionRefused
+/// на сокет, который раньше создавался только после handshake).
+fn offline_response(cmd: &Command) -> String {
+    match cmd {
+        Command::Status => {
+            "{\"state\":\"connecting\",\"elapsed\":null,\"duration\":null,\"stream_stats\":null}"
+                .into()
+        }
+        _ => "{\"ok\":false,\"error\":\"endpoint не подключён — контроллер подключается\"}".into(),
     }
 }
 
@@ -392,7 +417,6 @@ async fn send_next_packet(ep: &mut ConnectedEndpoint, p: &mut Player) {
 }
 
 async fn stream_loop(
-    mut ep: ConnectedEndpoint,
     mut cmd_rx: mpsc::Receiver<Command>,
     resp_tx: mpsc::Sender<String>,
     config: ControllerConfig,
@@ -414,19 +438,49 @@ async fn stream_loop(
     // статистикой и reader-задача endpoint-соединения заблокируется.
     let mut last_stats: Option<(StreamStats, Instant)> = None;
     let mut stats_open = true;
+    // Соединение с endpoint живёт внутри цикла: сокет команд уже слушает, и
+    // на время подключения (endpoint спит / handshake завис) backend получает
+    // честный «connecting» вместо ConnectionRefused.
+    let mut ep: Option<ConnectedEndpoint> = None;
+    let mut connecting: Option<Pin<Box<dyn Future<Output = ConnectedEndpoint> + Send>>> = None;
 
     loop {
         // endpoint перезапустился (TCP умер): переподключаемся ДО обработки
         // команды, иначе play «пройдёт успешно» в никуда (backend покажет
         // playing, звука нет). Старый поток нежизнеспособен — честный paused.
-        if !ep.is_reader_alive() {
+        if ep.as_ref().is_some_and(|e| !e.is_reader_alive()) {
             warn!("соединение с endpoint потеряно — переподключение к {target}");
-            ep = connect_with_retry(&config, target).await;
-            let _ = ep.clock_sync_bootstrap().await;
+            ep = None;
             p.playing = false;
             last_stats = None;
             stats_open = true;
         }
+        if ep.is_none() && connecting.is_none() {
+            let cfg = config.clone();
+            connecting =
+                Some(Box::pin(async move { connect_with_retry(&cfg, target).await }));
+        }
+        if let Some(mut fut) = connecting.take() {
+            tokio::select! {
+                mut new_ep = fut.as_mut() => {
+                    let _ = new_ep.clock_sync_bootstrap().await;
+                    info!(target = %target, endpoint = %new_ep.info.endpoint_name, "подключён");
+                    ep = Some(new_ep);
+                }
+                c = cmd_rx.recv() => {
+                    match c {
+                        Some(cmd) => {
+                            let resp = offline_response(&cmd);
+                            let _ = resp_tx.send(resp).await;
+                            connecting = Some(fut);
+                        }
+                        None => break,
+                    }
+                }
+            }
+            continue;
+        }
+        let ep = ep.as_mut().expect("endpoint подключён");
         if p.playing && p.track.is_some() {
             let t = p.track.as_ref().unwrap();
             let expected =
@@ -438,7 +492,7 @@ async fn stream_loop(
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(c) => {
-                            let resp = handle(&mut ep, &mut p, c, &last_stats).await;
+                            let resp = handle(ep, &mut p, c, &last_stats).await;
                             let _ = resp_tx.send(resp).await;
                         }
                         None => break,
@@ -450,7 +504,7 @@ async fn stream_loop(
                     None => stats_open = false,
                 },
                 _ = tokio::time::sleep(sleep) => {
-                    send_next_packet(&mut ep, &mut p).await;
+                    send_next_packet(ep, &mut p).await;
                 }
             }
         } else {
@@ -460,7 +514,7 @@ async fn stream_loop(
             tokio::select! {
                 c = cmd_rx.recv() => match c {
                     Some(c) => {
-                        let resp = handle(&mut ep, &mut p, c, &last_stats).await;
+                        let resp = handle(ep, &mut p, c, &last_stats).await;
                         let _ = resp_tx.send(resp).await;
                     }
                     None => break,
@@ -508,12 +562,10 @@ async fn main() {
         clock_port,
         tls: false,
     };
-    let mut ep = connect_with_retry(&config, args.target).await;
-    info!(target = %args.target, endpoint = %ep.info.endpoint_name, "подключён");
-    if let Err(e) = ep.clock_sync_bootstrap().await {
-        warn!("clock sync failed: {e}");
-    }
 
+    // Сокет команд биндится ДО подключения к endpoint'у: пока endpoint спит
+    // или handshake висит, backend получает честный статус «connecting»,
+    // а не ConnectionRefused на залипший сокет прошлого процесса.
     let _ = std::fs::remove_file(&args.socket);
     let listener = match UnixListener::bind(&args.socket) {
         Ok(l) => l,
@@ -527,7 +579,7 @@ async fn main() {
     let (resp_tx, resp_rx) = mpsc::channel::<String>(64);
 
     tokio::spawn(async move {
-        stream_loop(ep, cmd_rx, resp_tx, config, args.target).await;
+        stream_loop(cmd_rx, resp_tx, config, args.target).await;
     });
 
     info!(socket = %args.socket, "слушаю команды");
