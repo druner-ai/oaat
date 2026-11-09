@@ -10,6 +10,10 @@
 # любого RPi OS-образа) или файлами firstrun.sh/userconf.txt в boot-секции.
 # I2S DAC-шляпы: раскомментируйте dtoverlay в config.txt (boot-секция видна с
 # любой ОС). Pi2Design 502DAC (PCM5122) = dtoverlay=hifiberry-dacplus.
+#
+# ВНИМАНИЕ (CI): НЕ использовать --network у virt-customize — на GitHub-runner'ах
+# libguestfs поднимает сеть через passt, который там падает (passt exited with
+# status 1). Все сетевые действия (apt) — в firstboot-скрипте на самой Pi.
 set -euo pipefail
 
 DEB="${DEB:?нужен DEB=путь к arm64 .deb пакета tune-bridge}"
@@ -27,19 +31,24 @@ curl -fL --retry 3 -o "$WORK/base.img.xz" "$BASE_URL"
 xz -d "$WORK/base.img.xz"
 IMG="$WORK/base.img"
 
-echo "== Кастомизирую образ (virt-customize)"
+echo "== Кастомизирую образ (virt-customize, без сети)"
 cp "$DEB" "$WORK/tune-bridge.deb"
+
+TOML=$'[endpoint]\nname = "SoundVault Pi"\nport = 9740\n\n[web_ui]\nenabled = true\nport = 9741\nbind = "0.0.0.0"\n# control_token генерируется автоматически при первом запуске\n# и подхватывается сервером SoundVault через mDNS TXT.\n'
+
+HAT_NOTE=$'\n# --- SoundVault: I2S DAC hat ---\n# Pi2Design 502DAC (PCM5122), HiFiBerry DAC+/Pro/Amp2:\n#dtoverlay=hifiberry-dacplus\n# Рекомендуется при использовании DAC-шляпы:\n#dtparam=audio=off\n'
+
+FIRSTBOOT='apt-get update -qq && (apt-get install -y --no-install-recommends libasound2t64 || apt-get install -y --no-install-recommends libasound2) >/dev/null 2>&1; systemctl daemon-reload; systemctl enable oaat-endpoint.service; systemctl restart oaat-endpoint.service'
+
 virt-customize -a "$IMG" \
   --hostname soundvault-pi \
-  --network \
   --copy-in "$WORK/tune-bridge.deb:/tmp/" \
   --run-command "dpkg -i /tmp/tune-bridge.deb" \
-  --run-command "apt-get update -qq && (apt-get install -y --no-install-recommends libasound2t64 || apt-get install -y --no-install-recommends libasound2) || true" \
-  --write /etc/oaat/endpoint.toml:"$(printf '[endpoint]\nname = "SoundVault Pi"\nport = 9740\n\n[web_ui]\nenabled = true\nport = 9741\nbind = "0.0.0.0"\n# control_token генерируется автоматически при первом запуске\n# и подхватывается сервером SoundVault через mDNS TXT.\n')" \
-  --run-command "printf '\n# --- SoundVault: I2S DAC hat ---\n# Pi2Design 502DAC (PCM5122), HiFiBerry DAC+/Pro/Amp2:\n#dtoverlay=hifiberry-dacplus\n# Рекомендуется при использовании DAC-шляпы:\n#dtparam=audio=off\n' >> /boot/firmware/config.txt" \
-  --run-command "systemctl enable oaat-endpoint.service" \
+  --write "/etc/oaat/endpoint.toml:$TOML" \
+  --run-command "printf '%s' '$HAT_NOTE' >> /boot/firmware/config.txt" \
+  --run-command "ln -sf /etc/systemd/system/oaat-endpoint.service /etc/systemd/system/multi-user.target.wants/oaat-endpoint.service" \
   --run-command "rm -f /etc/oaat/endpoint.toml.token" \
-  --firstboot-command "systemctl restart oaat-endpoint.service"
+  --firstboot-command "$FIRSTBOOT"
 
 echo "== Сжимаю"
 xz -9e -T0 "$IMG"
