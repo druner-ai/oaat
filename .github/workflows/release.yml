@@ -141,8 +141,37 @@ jobs:
             tune-bridge-*.zip
             tune-bridge_*.deb
 
-  release:
+  pi-image:
+    name: Raspberry Pi image (arm64)
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libguestfs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libguestfs-tools
+          sudo chmod 0644 /boot/vmlinuz* /boot/initrd* 2>/dev/null || true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aarch64-unknown-linux-gnu
+          path: deb
+
+      - name: Build Pi image
+        run: |
+          DEB=$(ls deb/tune-bridge_*_arm64.deb | head -1) bash scripts/build-pi-image.sh soundvault-pi-arm64.img.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-image
+          path: |
+            soundvault-pi-arm64.img.xz
+            soundvault-pi-arm64.img.xz.sha256
+
+  release:
+    needs: [build, pi-image]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

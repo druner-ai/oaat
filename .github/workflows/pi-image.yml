@@ -1,0 +1,51 @@
+name: Pi image
+
+# Ручная сборка образа Raspberry Pi (arm64) — артефакт run'а.
+# На тег vX.Y.Z образ собирается автоматически в Release (job pi-image).
+
+on:
+  workflow_dispatch:
+    inputs:
+      deb_tag:
+        description: "Тег релиза oaat, из которого взять arm64 .deb (latest = последний)"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  pi-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libguestfs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libguestfs-tools
+          # supermin-аплайнс требует чтения vmlinuz/initrd раннером без root
+          sudo chmod 0644 /boot/vmlinuz* /boot/initrd* 2>/dev/null || true
+
+      - name: Download arm64 .deb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.deb_tag }}"
+          if [ "$TAG" = "latest" ] || [ -z "$TAG" ]; then
+            gh release download -R druner-ai/oaat -p 'tune-bridge_latest_arm64.deb'
+          else
+            gh release download "$TAG" -R druner-ai/oaat -p 'tune-bridge_*_arm64.deb'
+          fi
+          ls -lh tune-bridge_*arm64.deb
+
+      - name: Build Pi image
+        run: |
+          DEB=$(ls tune-bridge_*arm64.deb | head -1) bash scripts/build-pi-image.sh soundvault-pi-arm64.img.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-image
+          path: |
+            soundvault-pi-arm64.img.xz
+            soundvault-pi-arm64.img.xz.sha256
