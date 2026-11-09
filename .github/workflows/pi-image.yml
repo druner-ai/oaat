@@ -16,7 +16,8 @@ permissions:
 
 jobs:
   pi-image:
-    runs-on: ubuntu-latest
+    # pin: не latest — cutover раннера не должен ломать libguestfs-сборку
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -26,6 +27,8 @@ jobs:
           sudo apt-get install -y libguestfs-tools
           # supermin-аплайнс требует чтения vmlinuz/initrd раннером без root
           sudo chmod 0644 /boot/vmlinuz* /boot/initrd* 2>/dev/null || true
+          # KVM ускоряет appliance на порядок (без него supermin софтовый)
+          sudo chmod 0666 /dev/kvm 2>/dev/null || true
 
       - name: Download arm64 .deb
         env:

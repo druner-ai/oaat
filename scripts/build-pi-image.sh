@@ -11,9 +11,9 @@
 # I2S DAC-шляпы: раскомментируйте dtoverlay в config.txt (boot-секция видна с
 # любой ОС). Pi2Design 502DAC (PCM5122) = dtoverlay=hifiberry-dacplus.
 #
-# ВНИМАНИЕ (CI): НЕ использовать --network у virt-customize — на GitHub-runner'ах
-# libguestfs поднимает сеть через passt, который там падает (passt exited with
-# status 1). Все сетевые действия (apt) — в firstboot-скрипте на самой Pi.
+# ВНИМАНИЕ (CI): на ubuntu-24.04 раннерах libguestfs поднимает сеть appliance
+# через passt, который там падает (passt exited with status 1) — поэтому
+# --no-network ОБЯЗАТЕЛЕН, а все сетевые действия (apt) — в firstboot-скрипте.
 set -euo pipefail
 
 DEB="${DEB:?нужен DEB=путь к arm64 .deb пакета tune-bridge}"
@@ -41,6 +41,7 @@ HAT_NOTE=$'\n# --- SoundVault: I2S DAC hat ---\n# Pi2Design 502DAC (PCM5122), Hi
 FIRSTBOOT='apt-get update -qq && (apt-get install -y --no-install-recommends libasound2t64 || apt-get install -y --no-install-recommends libasound2) >/dev/null 2>&1; systemctl daemon-reload; systemctl enable oaat-endpoint.service; systemctl restart oaat-endpoint.service'
 
 virt-customize -a "$IMG" \
+  --no-network \
   --hostname soundvault-pi \
   --copy-in "$WORK/tune-bridge.deb:/tmp/" \
   --run-command "dpkg -i /tmp/tune-bridge.deb" \
