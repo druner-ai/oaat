@@ -16,9 +16,9 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use oaat_controller::{ClockResponder, ConnectedEndpoint, ControllerConfig};
+use oaat_controller::{ClockResponder, ConnectedEndpoint, ControllerConfig, EndpointResponse};
 use oaat_core::format::{AudioFormat, ChannelLayout};
-use oaat_core::message::{Pause, TrackMetadata};
+use oaat_core::message::{Pause, StreamStats, TrackMetadata};
 use oaat_core::wire::PacketFlags;
 use oaat_core::Message;
 
@@ -181,7 +181,12 @@ async fn connect_with_retry(config: &ControllerConfig, target: SocketAddr) -> Co
     }
 }
 
-async fn handle(ep: &mut ConnectedEndpoint, p: &mut Player, cmd: Command) -> String {
+async fn handle(
+    ep: &mut ConnectedEndpoint,
+    p: &mut Player,
+    cmd: Command,
+    stats: &Option<(StreamStats, Instant)>,
+) -> String {
     match cmd {
         Command::Play { path, title, artist, album } => match parse_wav(&path) {
             Err(e) => format!("{{\"ok\":false,\"error\":\"{e}\"}}"),
@@ -306,18 +311,34 @@ async fn handle(ep: &mut ConnectedEndpoint, p: &mut Player, cmd: Command) -> Str
             info!(lvl, "volume");
             format!("{{\"ok\":true,\"volume\":{lvl}}}")
         }
-        Command::Status => match &p.track {
-            None => "{\"state\":\"stop\",\"elapsed\":null,\"duration\":null}".into(),
-            Some(t) => {
-                let state = if p.playing { "playing" } else { "paused" };
-                let el = if p.playing { elapsed_ns(p) } else { p.base_elapsed_ns };
-                format!(
-                    "{{\"state\":\"{state}\",\"elapsed\":{},\"duration\":{}}}",
-                    el as f64 / 1e9,
-                    t.duration_s
-                )
+        Command::Status => {
+            let stats_json = match stats {
+                Some((ss, at)) if at.elapsed() < Duration::from_secs(30) => format!(
+                    ",\"stream_stats\":{{\"drift_us\":{},\"corrections\":{},\"lost\":{},\"recovered\":{},\"buffer_frames\":{},\"bit_perfect\":{},\"underruns\":{},\"age_s\":{:.1}}}",
+                    ss.drift_us,
+                    ss.corrections_net_frames,
+                    ss.packets_lost,
+                    ss.packets_recovered,
+                    ss.buffer_frames,
+                    ss.bit_perfect,
+                    ss.underruns,
+                    at.elapsed().as_secs_f64()
+                ),
+                _ => ",\"stream_stats\":null".to_string(),
+            };
+            match &p.track {
+                None => format!("{{\"state\":\"stop\",\"elapsed\":null,\"duration\":null{stats_json}}}"),
+                Some(t) => {
+                    let state = if p.playing { "playing" } else { "paused" };
+                    let el = if p.playing { elapsed_ns(p) } else { p.base_elapsed_ns };
+                    format!(
+                        "{{\"state\":\"{state}\",\"elapsed\":{},\"duration\":{}{stats_json}}}",
+                        el as f64 / 1e9,
+                        t.duration_s
+                    )
+                }
             }
-        },
+        }
     }
 }
 
@@ -388,6 +409,11 @@ async fn stream_loop(
         base_elapsed_ns: 0,
         seek_pending: false,
     };
+    // Последние StreamStats от endpoint'а (дрейф/underrun/потери/bit-perfect).
+    // Дренируем response_rx между командами — иначе канал (32 слота) забьётся
+    // статистикой и reader-задача endpoint-соединения заблокируется.
+    let mut last_stats: Option<(StreamStats, Instant)> = None;
+    let mut stats_open = true;
 
     loop {
         // endpoint перезапустился (TCP умер): переподключаемся ДО обработки
@@ -398,6 +424,8 @@ async fn stream_loop(
             ep = connect_with_retry(&config, target).await;
             let _ = ep.clock_sync_bootstrap().await;
             p.playing = false;
+            last_stats = None;
+            stats_open = true;
         }
         if p.playing && p.track.is_some() {
             let t = p.track.as_ref().unwrap();
@@ -410,12 +438,17 @@ async fn stream_loop(
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(c) => {
-                            let resp = handle(&mut ep, &mut p, c).await;
+                            let resp = handle(&mut ep, &mut p, c, &last_stats).await;
                             let _ = resp_tx.send(resp).await;
                         }
                         None => break,
                     }
                 }
+                r = ep.response_rx.recv(), if stats_open => match r {
+                    Some(EndpointResponse::StreamStats(ss)) => last_stats = Some((ss, Instant::now())),
+                    Some(_) => {}
+                    None => stats_open = false,
+                },
                 _ = tokio::time::sleep(sleep) => {
                     send_next_packet(&mut ep, &mut p).await;
                 }
@@ -427,10 +460,15 @@ async fn stream_loop(
             tokio::select! {
                 c = cmd_rx.recv() => match c {
                     Some(c) => {
-                        let resp = handle(&mut ep, &mut p, c).await;
+                        let resp = handle(&mut ep, &mut p, c, &last_stats).await;
                         let _ = resp_tx.send(resp).await;
                     }
                     None => break,
+                },
+                r = ep.response_rx.recv(), if stats_open => match r {
+                    Some(EndpointResponse::StreamStats(ss)) => last_stats = Some((ss, Instant::now())),
+                    Some(_) => {}
+                    None => stats_open = false,
                 },
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {}
             }

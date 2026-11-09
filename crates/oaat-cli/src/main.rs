@@ -706,6 +706,10 @@ async fn run_endpoint(
     let alsa_mixer = if dac_config.hardware_volume {
         let mixer = oaat_endpoint::AlsaMixer::new(dac_config.card);
         mixer.init(dac_config.fir_filter.as_deref());
+        // Boot-sync: after a machine reboot the ALSA mixer may sit at 0 while
+        // the endpoint's logical volume starts at 100% — align them so sound
+        // is audible before the controller pushes its first VolumeSet.
+        mixer.set_volume(100);
         Some(mixer)
     } else {
         None
