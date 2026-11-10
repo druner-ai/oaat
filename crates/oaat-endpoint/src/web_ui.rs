@@ -580,7 +580,11 @@ where
             Ok(json_response(200, body))
         }
         (&Method::GET, "/api/network") => {
-            let body = tokio::task::spawn_blocking(crate::network::network_json)
+            let rescan = req
+                .uri()
+                .query()
+                .is_some_and(|q| q.split('&').any(|kv| kv == "rescan=1"));
+            let body = tokio::task::spawn_blocking(move || crate::network::network_json(rescan))
                 .await
                 .unwrap_or_else(|_| "{}".to_string());
             Ok(json_response(200, body))

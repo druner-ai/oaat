@@ -22,7 +22,7 @@ fn sh(cmd: &str, args: &[&str]) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub fn network_json() -> String {
+pub fn network_json(rescan: bool) -> String {
     // current connection: ACTIVE,SSID,SIGNAL from `nmcli device wifi list`
     let mut ssid = String::new();
     let mut signal: Option<i32> = None;
@@ -47,35 +47,59 @@ pub fn network_json() -> String {
         .unwrap_or("")
         .to_string();
 
-    // available networks: SSID,SIGNAL,SECURITY
-    let mut available = String::new();
+    // available networks: SSID,SIGNAL,SECURITY; дедупликация по SSID
+    // (nmcli перечисляет каждый BSSID отдельно — оставляем сильнейший)
+    let rescan_flag = if rescan { "yes" } else { "no" };
     let avail = sh(
         "nmcli",
-        &["-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list"],
+        &[
+            "-t",
+            "-f",
+            "SSID,SIGNAL,SECURITY",
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            rescan_flag,
+        ],
     );
-    let mut first = true;
+    let mut best: std::collections::BTreeMap<String, (i32, String)> =
+        std::collections::BTreeMap::new();
     for line in avail.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let mut it = line.splitn(3, ':');
         let s = it.next().unwrap_or("").to_string();
-        let sig = it.next().and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(0);
+        let sig = it
+            .next()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0);
         let sec = it.next().unwrap_or("").to_string();
         if s.is_empty() {
             continue;
         }
-        if !first {
-            available.push(',');
-        }
-        first = false;
-        available.push_str(&format!(
-            r#"{{"ssid":{},"signal":{},"security":{}}}"#,
-            jstr(&s),
-            sig,
-            jstr(&sec)
-        ));
+        best.entry(s)
+            .and_modify(|e| {
+                if sig > e.0 {
+                    e.0 = sig;
+                    e.1 = sec.clone();
+                }
+            })
+            .or_insert((sig, sec));
     }
+    let available = best
+        .iter()
+        .map(|(s, (sig, sec))| {
+            format!(
+                r#"{{"ssid":{},"signal":{},"security":{}}}"#,
+                jstr(s),
+                sig,
+                jstr(sec)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
 
     let connected = !ssid.is_empty();
     format!(
@@ -89,7 +113,7 @@ pub fn network_json() -> String {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn network_json() -> String {
+pub fn network_json(_rescan: bool) -> String {
     r#"{"current":{"ssid":"","signal":0,"ip":"","connected":false},"available":[]}"#.into()
 }
 

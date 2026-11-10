@@ -287,8 +287,8 @@
       });
     });
   }
-  function pollNetwork(){
-    json('/api/network').then(renderNetwork).catch(function(){});
+  function pollNetwork(rescan){
+    json('/api/network' + (rescan === true ? '?rescan=1' : '')).then(renderNetwork).catch(function(){});
   }
 
   // --- spotify ---
@@ -316,7 +316,7 @@
       pollNetwork();
     }).catch(function(){ $('wifi-ok').disabled = false; });
   });
-  $('refresh-wifi').addEventListener('click', pollNetwork);
+  $('refresh-wifi').addEventListener('click', function(){ pollNetwork(true); });
   $('sp-start').addEventListener('click', function(){ post('/api/spotify/start').then(pollSpotify); });
   $('sp-stop').addEventListener('click', function(){ post('/api/spotify/stop').then(pollSpotify); });
 
