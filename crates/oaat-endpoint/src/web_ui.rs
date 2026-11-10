@@ -114,6 +114,19 @@ pub fn set_token_file(path: std::path::PathBuf) {
     let _ = TOKEN_FILE.set(path);
 }
 
+/// Статический UI настроек endpoint'а (Обзор / Сеть / Spotify Connect),
+/// встраивается в бинарь на этапе компиляции.
+static INDEX_HTML: &str = include_str!("../assets/index.html");
+
+/// JSON-ответ с заданным статус-кодом.
+fn json_response(status: u16, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
 /// Channel for release requests (`POST /api/release`) from the web UI to the
 /// main loop.
 pub type ReleaseTx = tokio::sync::mpsc::Sender<()>;
@@ -350,7 +363,13 @@ where
     if req.method() == Method::POST
         && matches!(
             req.uri().path(),
-            "/api/device" | "/api/release" | "/api/token/regenerate" | "/api/update"
+            "/api/device"
+                | "/api/release"
+                | "/api/token/regenerate"
+                | "/api/update"
+                | "/api/network/connect"
+                | "/api/spotify/start"
+                | "/api/spotify/stop"
         )
         && let Err(code) = policy.authorize(&req)
     {
@@ -411,15 +430,11 @@ where
                 )))
                 .unwrap())
         }
-        (&Method::GET, "/") | (&Method::GET, "/index.html") => {
-            let status = status_handle.snapshot().await;
-            let html = render_html(&status);
-            Ok(Response::builder()
-                .status(200)
-                .header("Content-Type", "text/html; charset=utf-8")
-                .body(Full::new(Bytes::from(html)))
-                .unwrap())
-        }
+        (&Method::GET, "/") | (&Method::GET, "/index.html") => Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Full::new(Bytes::from_static(INDEX_HTML.as_bytes())))
+            .unwrap()),
         (&Method::GET, "/api/devices") => {
             let devs = list_devices();
             let arr = devs
@@ -556,6 +571,93 @@ where
                     .unwrap()),
             }
         }
+        (&Method::GET, "/api/system") => {
+            let body = tokio::task::spawn_blocking(|| {
+                crate::sysinfo::system_json(&crate::sysinfo::collect())
+            })
+            .await
+            .unwrap_or_else(|_| "{}".to_string());
+            Ok(json_response(200, body))
+        }
+        (&Method::GET, "/api/network") => {
+            let body = tokio::task::spawn_blocking(crate::network::network_json)
+                .await
+                .unwrap_or_else(|_| "{}".to_string());
+            Ok(json_response(200, body))
+        }
+        (&Method::GET, "/api/spotify/status") => {
+            let body = tokio::task::spawn_blocking(crate::spotify::spotify_status_json)
+                .await
+                .unwrap_or_else(|_| "{}".to_string());
+            Ok(json_response(200, body))
+        }
+        (&Method::POST, "/api/network/connect") => {
+            use http_body_util::BodyExt;
+            let body = req
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let v = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+            let ssid = v
+                .get("ssid")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let password = v
+                .get("password")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if ssid.is_empty() {
+                return Ok(json_response(
+                    400,
+                    r#"{"ok":false,"error":"missing ssid"}"#.to_string(),
+                ));
+            }
+            info!("web UI: wi-fi connect requested");
+            match tokio::task::spawn_blocking(move || {
+                crate::network::connect_wifi(&ssid, &password)
+            })
+            .await
+            {
+                Ok(Ok(())) => Ok(json_response(200, r#"{"ok":true}"#.to_string())),
+                Ok(Err(e)) => Ok(json_response(
+                    400,
+                    serde_json::json!({"ok": false, "error": e}).to_string(),
+                )),
+                Err(_) => Ok(json_response(
+                    500,
+                    r#"{"ok":false,"error":"task failed"}"#.to_string(),
+                )),
+            }
+        }
+        (&Method::POST, "/api/spotify/start") => {
+            match tokio::task::spawn_blocking(crate::spotify::spotify_start).await {
+                Ok(Ok(())) => Ok(json_response(200, r#"{"ok":true}"#.to_string())),
+                Ok(Err(e)) => Ok(json_response(
+                    400,
+                    serde_json::json!({"ok": false, "error": e}).to_string(),
+                )),
+                Err(_) => Ok(json_response(
+                    500,
+                    r#"{"ok":false,"error":"task failed"}"#.to_string(),
+                )),
+            }
+        }
+        (&Method::POST, "/api/spotify/stop") => {
+            match tokio::task::spawn_blocking(crate::spotify::spotify_stop).await {
+                Ok(Ok(())) => Ok(json_response(200, r#"{"ok":true}"#.to_string())),
+                Ok(Err(e)) => Ok(json_response(
+                    400,
+                    serde_json::json!({"ok": false, "error": e}).to_string(),
+                )),
+                Err(_) => Ok(json_response(
+                    500,
+                    r#"{"ok":false,"error":"task failed"}"#.to_string(),
+                )),
+            }
+        }
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("Not Found")))
@@ -599,166 +701,6 @@ fn render_status_json(status: &BridgeStatus) -> String {
     )
 }
 
-fn render_html(status: &BridgeStatus) -> String {
-    let now_playing = if status.playing {
-        let title = status.track_title.as_deref().unwrap_or("Unknown");
-        let artist = status.track_artist.as_deref().unwrap_or("");
-        let album = status.track_album.as_deref().unwrap_or("");
-        let artwork = status.artwork_url.as_deref().unwrap_or("");
-        let format_badge = if let Some(ref fmt) = status.stream_format {
-            let rate = status.stream_sample_rate.unwrap_or(0);
-            let bits = status.stream_bits.unwrap_or(0);
-            let rate_khz = rate as f64 / 1000.0;
-            if rate_khz.fract() == 0.0 {
-                format!(
-                    r#"<span class="badge">{fmt} {bits}/{}</span>"#,
-                    rate_khz as u32
-                )
-            } else {
-                format!(r#"<span class="badge">{fmt} {bits}/{rate_khz:.1}</span>"#)
-            }
-        } else {
-            String::new()
-        };
-        let art_html = if artwork.is_empty() {
-            r#"<div class="art-placeholder"></div>"#.to_string()
-        } else {
-            format!(r#"<img class="art" src="{artwork}" alt="">"#)
-        };
-        format!(
-            r#"<div class="now-playing">
-      {art_html}
-      <div class="track-info">
-        <div class="track-title">{title}</div>
-        <div class="track-artist">{artist}</div>
-        <div class="track-album">{album}</div>
-        {format_badge}
-      </div>
-    </div>"#
-        )
-    } else {
-        r#"<div class="now-playing idle">
-      <div class="art-placeholder"></div>
-      <div class="track-info"><div class="track-title idle-text">Idle</div></div>
-    </div>"#
-            .into()
-    };
-
-    let conn_dot = if status.connected {
-        "connected"
-    } else {
-        "disconnected"
-    };
-    let conn_text = if status.connected {
-        status.controller_name.as_deref().unwrap_or("Connected")
-    } else {
-        "Waiting..."
-    };
-
-    format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-  <title>{bridge_name}</title>
-  <style>
-    * {{ margin:0; padding:0; box-sizing:border-box; }}
-    html {{ font-size:18px; }}
-    body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-           background:#0d0d1a; color:#ccc; height:100vh; overflow:hidden;
-           display:flex; flex-direction:column; }}
-    header {{ display:flex; align-items:center; justify-content:space-between;
-              padding:0.6rem 1rem; background:#111125; border-bottom:1px solid #1a1a3a; }}
-    .bridge-name {{ font-size:0.85rem; font-weight:600; color:#fff; }}
-    .conn {{ display:flex; align-items:center; gap:0.4rem; font-size:0.75rem; }}
-    .dot {{ width:8px; height:8px; border-radius:50%; }}
-    .dot.connected {{ background:#4ade80; box-shadow:0 0 6px #4ade80; }}
-    .dot.disconnected {{ background:#f87171; }}
-    main {{ flex:1; display:flex; flex-direction:column; justify-content:center;
-            align-items:center; padding:1.5rem; gap:1.5rem; }}
-    .now-playing {{ display:flex; align-items:center; gap:1.2rem; width:100%; max-width:500px; }}
-    .now-playing.idle {{ opacity:0.4; }}
-    .art {{ width:120px; height:120px; border-radius:8px; object-fit:cover;
-            background:#1a1a3a; flex-shrink:0; }}
-    .art-placeholder {{ width:120px; height:120px; border-radius:8px;
-                        background:#1a1a3a; flex-shrink:0;
-                        display:flex; align-items:center; justify-content:center; }}
-    .art-placeholder::after {{ content:""; display:block; width:40px; height:40px;
-                               border-radius:50%; border:3px solid #333; }}
-    .track-info {{ min-width:0; }}
-    .track-title {{ font-size:1.3rem; font-weight:700; color:#fff;
-                    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-    .track-artist {{ font-size:1rem; color:#aaa; margin-top:0.15rem;
-                     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-    .track-album {{ font-size:0.8rem; color:#666; margin-top:0.1rem;
-                    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-    .idle-text {{ color:#555; font-style:italic; }}
-    .badge {{ display:inline-block; margin-top:0.5rem; padding:0.2rem 0.6rem;
-              border-radius:4px; font-size:0.7rem; font-weight:600;
-              background:#1a1a3a; color:#4ade80; letter-spacing:0.03em; }}
-    .volume {{ width:100%; max-width:500px; }}
-    .vol-row {{ display:flex; align-items:center; gap:0.8rem; }}
-    .vol-icon {{ font-size:1.2rem; color:#888; flex-shrink:0; cursor:pointer; }}
-    .vol-slider {{ flex:1; -webkit-appearance:none; appearance:none; height:6px;
-                   border-radius:3px; background:#1a1a3a; outline:none; }}
-    .vol-slider::-webkit-slider-thumb {{ -webkit-appearance:none; width:24px; height:24px;
-                                         border-radius:50%; background:#4ade80; cursor:pointer; }}
-    .vol-val {{ font-size:0.8rem; color:#888; width:2.5rem; text-align:right; }}
-    .device {{ font-size:0.7rem; color:#555; text-align:center; }}
-  </style>
-</head>
-<body>
-  <header>
-    <span class="bridge-name">{bridge_name}</span>
-    <span class="conn"><span class="dot {conn_dot}"></span>{conn_text}</span>
-  </header>
-  <main>
-    {now_playing}
-    <div class="volume">
-      <div class="vol-row">
-        <span class="vol-icon" onclick="toggleMute()">&#128264;</span>
-        <input class="vol-slider" type="range" min="0" max="100" value="{volume}"
-               oninput="setVol(this.value)">
-        <span class="vol-val" id="vol-val">{volume}%</span>
-      </div>
-    </div>
-    <div class="device">{current_device}</div>
-  </main>
-  <script>
-    function setVol(v) {{
-      document.getElementById('vol-val').textContent = v + '%';
-      fetch('/api/volume', {{method:'POST',
-        headers:{{'Content-Type':'application/json'}},
-        body:JSON.stringify({{volume:parseInt(v)}})
-      }});
-    }}
-    function toggleMute() {{
-      fetch('/api/mute', {{method:'POST'}});
-    }}
-    async function poll() {{
-      try {{
-        const r = await fetch('/api/status');
-        const s = await r.json();
-        if (s.track_title) {{
-          document.querySelector('.track-title').textContent = s.track_title || 'Unknown';
-          document.querySelector('.track-artist').textContent = s.track_artist || '';
-          document.querySelector('.track-album').textContent = s.track_album || '';
-        }}
-      }} catch(e) {{}}
-    }}
-    setInterval(poll, 3000);
-  </script>
-</body>
-</html>"##,
-        bridge_name = status.bridge_name,
-        conn_dot = conn_dot,
-        conn_text = conn_text,
-        now_playing = now_playing,
-        volume = status.volume,
-        current_device = status.current_device,
-    )
-}
 
 #[cfg(test)]
 mod control_tests;

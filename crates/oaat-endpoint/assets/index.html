@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>SoundVault Endpoint</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { font-size:16px; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:#0d0d1a; color:#ccc; height:100vh; display:flex; overflow:hidden; }
+  /* Sidebar */
+  .sidebar { width:200px; background:#111125; border-right:1px solid #1a1a3a;
+             display:flex; flex-direction:column; flex-shrink:0; }
+  .brand { padding:1rem 1rem 0.75rem; border-bottom:1px solid #1a1a3a; }
+  .brand .name { font-size:0.9rem; font-weight:700; color:#fff; }
+  .brand .sub { font-size:0.7rem; color:#666; margin-top:2px; }
+  nav { flex:1; padding:0.5rem 0; }
+  nav a { display:flex; align-items:center; gap:0.6rem; padding:0.6rem 1rem;
+          color:#999; text-decoration:none; font-size:0.85rem; cursor:pointer;
+          border-left:2px solid transparent; }
+  nav a:hover { background:#161631; color:#ddd; }
+  nav a.active { color:#4ade80; border-left-color:#4ade80; background:#161631; }
+  nav a .ico { width:16px; text-align:center; }
+  .token-box { padding:0.75rem 1rem; border-top:1px solid #1a1a3a; }
+  .token-box label { font-size:0.65rem; color:#666; text-transform:uppercase; letter-spacing:0.05em; }
+  .token-box input { width:100%; margin-top:0.3rem; background:#0d0d1a; color:#ccc;
+                     border:1px solid #1a1a3a; border-radius:4px; padding:0.35rem 0.5rem;
+                     font-size:0.75rem; font-family:monospace; }
+  /* Main */
+  main { flex:1; overflow-y:auto; padding:1.5rem; }
+  section.page { display:none; }
+  section.page.active { display:block; }
+  h1 { font-size:1.2rem; color:#fff; margin-bottom:1rem; }
+  h2 { font-size:0.8rem; color:#666; text-transform:uppercase; letter-spacing:0.06em;
+       margin:1.2rem 0 0.5rem; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:0.75rem; }
+  .card { background:#111125; border:1px solid #1a1a3a; border-radius:8px; padding:0.9rem; }
+  .card .k { font-size:0.7rem; color:#666; text-transform:uppercase; letter-spacing:0.04em; }
+  .card .v { font-size:1.15rem; color:#fff; margin-top:0.3rem; font-weight:600;
+             word-break:break-all; }
+  .card .v small { font-size:0.75rem; color:#888; font-weight:400; }
+  /* status pill */
+  .pill { display:inline-flex; align-items:center; gap:0.35rem; padding:0.2rem 0.6rem;
+          border-radius:999px; font-size:0.72rem; font-weight:600; }
+  .pill.ok { background:#0f2f1d; color:#4ade80; }
+  .pill.bad { background:#2f1212; color:#f87171; }
+  .pill.idle { background:#1a1a3a; color:#888; }
+  .dot { width:7px; height:7px; border-radius:50%; }
+  .pill.ok .dot { background:#4ade80; }
+  .pill.bad .dot { background:#f87171; }
+  .pill.idle .dot { background:#666; }
+  /* wifi list */
+  .wifi-item { display:flex; align-items:center; justify-content:space-between;
+               padding:0.7rem 0.9rem; background:#111125; border:1px solid #1a1a3a;
+               border-radius:8px; margin-bottom:0.5rem; cursor:pointer; }
+  .wifi-item:hover { border-color:#2a2a5a; }
+  .wifi-item .left { display:flex; align-items:center; gap:0.7rem; }
+  .wifi-item .ssid { color:#fff; font-size:0.9rem; }
+  .wifi-item .meta { font-size:0.7rem; color:#666; margin-top:2px; }
+  .wifi-item .sig { color:#4ade80; font-size:0.8rem; }
+  .wifi-item .lock { color:#888; font-size:0.8rem; }
+  .wifi-item.current { border-color:#4ade80; }
+  .wifi-item.current .ssid::after { content:" ●"; color:#4ade80; font-size:0.6rem; }
+  /* buttons */
+  button { background:#1a1a3a; color:#ddd; border:none; border-radius:6px;
+           padding:0.5rem 0.9rem; font-size:0.85rem; cursor:pointer; }
+  button:hover { background:#222250; }
+  button.primary { background:#14532d; color:#4ade80; }
+  button.primary:hover { background:#166534; }
+  button.danger { background:#2f1212; color:#f87171; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  .row { display:flex; align-items:center; gap:0.6rem; }
+  /* modal */
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,0.6); display:none;
+           align-items:center; justify-content:center; z-index:10; }
+  .modal.open { display:flex; }
+  .modal .box { background:#111125; border:1px solid #2a2a5a; border-radius:10px;
+                padding:1.2rem; width:320px; max-width:90vw; }
+  .modal .box h3 { color:#fff; font-size:1rem; margin-bottom:0.8rem; }
+  .modal label { font-size:0.7rem; color:#888; display:block; margin:0.6rem 0 0.25rem; }
+  .modal input { width:100%; background:#0d0d1a; color:#ccc; border:1px solid #1a1a3a;
+                 border-radius:5px; padding:0.5rem; font-size:0.9rem; }
+  .modal .actions { display:flex; justify-content:flex-end; gap:0.5rem; margin-top:1rem; }
+  .muted { color:#666; font-size:0.8rem; }
+  .spacer { flex:1; }
+</style>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="name" id="brand-name">SoundVault</div>
+      <div class="sub" id="brand-sub">endpoint</div>
+    </div>
+    <nav>
+      <a data-page="overview" class="active"><span class="ico">◉</span> Обзор</a>
+      <a data-page="network"><span class="ico">⇶</span> Сеть</a>
+      <a data-page="spotify"><span class="ico">♫</span> Spotify Connect</a>
+    </nav>
+    <div class="token-box">
+      <label>Токен управления</label>
+      <input id="token" type="password" placeholder="для изменений" autocomplete="off">
+    </div>
+  </aside>
+
+  <main>
+    <!-- ОБЗОР -->
+    <section class="page active" id="page-overview">
+      <div class="row">
+        <h1>Обзор</h1>
+        <div class="spacer"></div>
+        <span class="pill" id="conn-pill"><span class="dot"></span><span id="conn-text">—</span></span>
+      </div>
+      <div class="grid" id="sys-grid"></div>
+      <h2>Звук</h2>
+      <div class="grid" id="audio-grid"></div>
+    </section>
+
+    <!-- СЕТЬ -->
+    <section class="page" id="page-network">
+      <div class="row">
+        <h1>Сеть</h1>
+        <div class="spacer"></div>
+        <button id="refresh-wifi">Обновить</button>
+      </div>
+      <h2>Текущее подключение</h2>
+      <div class="card" id="current-wifi"><span class="muted">Загрузка…</span></div>
+      <h2>Доступные сети</h2>
+      <div id="wifi-list"><span class="muted">Загрузка…</span></div>
+    </section>
+
+    <!-- SPOTIFY -->
+    <section class="page" id="page-spotify">
+      <h1>Spotify Connect</h1>
+      <div class="card" style="max-width:420px">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <div class="k">Статус</div>
+            <div class="v" style="margin-top:0.4rem" id="sp-status">—</div>
+          </div>
+          <span class="pill" id="sp-pill"><span class="dot"></span><span id="sp-pill-text">—</span></span>
+        </div>
+        <div style="margin-top:0.6rem" class="muted" id="sp-device">—</div>
+        <div class="row" style="margin-top:1rem">
+          <button class="primary" id="sp-start">Запустить</button>
+          <button class="danger" id="sp-stop">Остановить</button>
+        </div>
+      </div>
+      <p class="muted" style="margin-top:0.8rem; max-width:420px">
+        Spotify Connect работает с аккаунтом Spotify Premium. Первая авторизация —
+        через SSH (`spotifyd authenticate`); после неё токен хранится на устройстве.
+      </p>
+    </section>
+  </main>
+
+  <!-- modal: connect wifi -->
+  <div class="modal" id="modal-wifi">
+    <div class="box">
+      <h3 id="wifi-title">Подключение</h3>
+      <label>Пароль</label>
+      <input id="wifi-pass" type="password" placeholder="пароль сети (если нужен)">
+      <div class="actions">
+        <button id="wifi-cancel">Отмена</button>
+        <button class="primary" id="wifi-ok">Подключить</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var token = localStorage.getItem('sv_token') || '';
+  $('token').value = token;
+  $('token').addEventListener('input', function(){
+    token = this.value.trim();
+    localStorage.setItem('sv_token', token);
+  });
+
+  function authHeaders(){ return token ? {'Authorization':'Bearer '+token} : {}; }
+
+  // --- navigation ---
+  var links = document.querySelectorAll('nav a');
+  links.forEach(function(a){
+    a.addEventListener('click', function(){
+      links.forEach(function(x){ x.classList.remove('active'); });
+      a.classList.add('active');
+      document.querySelectorAll('section.page').forEach(function(s){ s.classList.remove('active'); });
+      $('page-'+a.dataset.page).classList.add('active');
+    });
+  });
+
+  function json(url, opts){
+    return fetch(url, opts).then(function(r){ return r.json().catch(function(){ return {}; }); });
+  }
+  function post(url, body){
+    return json(url, {method:'POST', headers:Object.assign({'Content-Type':'application/json'}, authHeaders()), body:JSON.stringify(body||{})});
+  }
+
+  // --- overview ---
+  function fmtUptime(sec){
+    sec = Math.floor(sec||0);
+    var d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600), m = Math.floor(sec%3600/60);
+    if(d>0) return d+'д '+h+'ч'; if(h>0) return h+'ч '+m+'м'; return m+'м';
+  }
+  function mb(n){ if(n==null) return '—'; return (n/1048576).toFixed(1)+' ГБ'; }
+  function card(k, v){ return '<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>'; }
+  function pill(cls, txt){ return '<span class="pill '+cls+'"><span class="dot"></span>'+txt+'</span>'; }
+
+  function renderOverview(sys, st){
+    $('brand-name').textContent = st.bridge_name || 'SoundVault';
+    var ip = sys.ip || '—';
+    var html = '';
+    html += card('Имя', (sys.hostname||'—'));
+    html += card('IP-адрес', ip);
+    html += card('Версия', (st.version||'—'));
+    html += card('Uptime', fmtUptime(sys.uptime_sec));
+    html += card('Нагрузка', (sys.load_1!=null ? sys.load_1.toFixed(2)+' / '+sys.load_5.toFixed(2)+' / '+sys.load_15.toFixed(2) : '—'));
+    html += card('Память', mb(sys.mem_used)+'<br><small>из '+mb(sys.mem_total)+'</small>');
+    html += card('Диск', mb(sys.disk_used)+'<br><small>из '+mb(sys.disk_total)+'</small>');
+    html += card('Температура', (sys.temp_c!=null ? sys.temp_c.toFixed(1)+' °C' : '—'));
+    html += card('Платформа', (sys.os||'')+' '+(sys.arch||''));
+    $('sys-grid').innerHTML = html;
+
+    // connection pill
+    var c = st.connected;
+    var cls = c ? 'ok' : 'bad';
+    var txt = c ? (st.controller_name||'Подключено') : 'Нет контроллера';
+    $('conn-pill').className = 'pill '+cls;
+    $('conn-text').textContent = txt;
+
+    var ah = '';
+    ah += card('Устройство', st.current_device || '—');
+    ah += card('Громкость', (st.volume!=null ? st.volume+'%' : '—'));
+    ah += card('Состояние', st.playing ? 'играет' : 'пауза');
+    if(st.stream_format)
+      ah += card('Формат', st.stream_format + ' ' + (st.stream_bits||'') + '/' + (st.stream_sample_rate||''));
+    $('audio-grid').innerHTML = ah;
+  }
+
+  function pollOverview(){
+    json('/api/status').then(function(st){
+      json('/api/system').then(function(sys){
+        renderOverview(sys, st);
+      }).catch(function(){});
+    }).catch(function(){});
+  }
+
+  // --- network ---
+  var wifiTarget = null;
+  function sigIcon(pct){
+    if(pct>=75) return '▂▄▆█';
+    if(pct>=50) return '▂▄▆_';
+    if(pct>=25) return '▂▄__';
+    return '▂___';
+  }
+  function renderNetwork(n){
+    var cur = n.current;
+    var curHtml;
+    if(cur && cur.ssid){
+      curHtml = '<div class="v" style="margin-top:0.4rem">'+cur.ssid+'</div>'+
+        '<div class="muted" style="margin-top:0.3rem">'+ (cur.ip||'') +' · сигнал '+ (cur.signal!=null?cur.signal+'%':'—') +'</div>';
+    } else {
+      curHtml = '<span class="muted">Нет подключения</span>';
+    }
+    $('current-wifi').innerHTML = curHtml;
+
+    var list = (n.available||[]);
+    if(!list.length){ $('wifi-list').innerHTML = '<span class="muted">Сетей не найдено</span>'; return; }
+    list.sort(function(a,b){ return (b.signal||0)-(a.signal||0); });
+    var html = '';
+    list.forEach(function(w){
+      var isCur = cur && cur.ssid === w.ssid;
+      var sig = w.signal!=null ? w.signal+'%' : '—';
+      html += '<div class="wifi-item'+(isCur?' current':'')+'" data-ssid="'+w.ssid.replace(/"/g,'&quot;')+'">'+
+        '<div class="left"><span class="sig">'+sigIcon(w.signal||0)+'</span>'+
+        '<div><div class="ssid">'+w.ssid+'</div>'+
+        '<div class="meta">'+ (w.security ? '🔒 '+w.security : 'открытая') +'</div></div></div>'+
+        '<span class="sig">'+sig+'</span></div>';
+    });
+    $('wifi-list').innerHTML = html;
+    document.querySelectorAll('.wifi-item').forEach(function(el){
+      el.addEventListener('click', function(){
+        wifiTarget = el.dataset.ssid;
+        $('wifi-title').textContent = 'Подключиться к «'+wifiTarget+'»';
+        $('wifi-pass').value = '';
+        $('modal-wifi').classList.add('open');
+      });
+    });
+  }
+  function pollNetwork(){
+    json('/api/network').then(renderNetwork).catch(function(){});
+  }
+
+  // --- spotify ---
+  function renderSpotify(sp){
+    var active = sp.active;
+    $('sp-status').textContent = active ? 'Запущен' : 'Остановлен';
+    $('sp-pill').className = 'pill ' + (active ? 'ok' : 'idle');
+    $('sp-pill-text').textContent = active ? 'активен' : 'не активен';
+    $('sp-device').textContent = 'Устройство: ' + (sp.device_name || '—');
+    $('sp-start').disabled = active;
+    $('sp-stop').disabled = !active;
+  }
+  function pollSpotify(){
+    json('/api/spotify/status').then(renderSpotify).catch(function(){});
+  }
+
+  // --- modal actions ---
+  $('wifi-cancel').addEventListener('click', function(){ $('modal-wifi').classList.remove('open'); });
+  $('wifi-ok').addEventListener('click', function(){
+    var pass = $('wifi-pass').value;
+    $('wifi-ok').disabled = true;
+    post('/api/network/connect', {ssid:wifiTarget, password:pass}).then(function(r){
+      $('wifi-ok').disabled = false;
+      $('modal-wifi').classList.remove('open');
+      pollNetwork();
+    }).catch(function(){ $('wifi-ok').disabled = false; });
+  });
+  $('refresh-wifi').addEventListener('click', pollNetwork);
+  $('sp-start').addEventListener('click', function(){ post('/api/spotify/start').then(pollSpotify); });
+  $('sp-stop').addEventListener('click', function(){ post('/api/spotify/stop').then(pollSpotify); });
+
+  // --- polling ---
+  pollOverview();
+  pollNetwork();
+  pollSpotify();
+  setInterval(pollOverview, 5000);
+  setInterval(pollNetwork, 10000);
+  setInterval(pollSpotify, 5000);
+})();
+</script>
+</body>
+</html>

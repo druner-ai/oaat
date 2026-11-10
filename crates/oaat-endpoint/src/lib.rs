@@ -8,8 +8,14 @@ pub mod discovery;
 #[cfg(feature = "flac")]
 pub mod flac_decoder;
 pub mod hal;
+#[cfg(feature = "web-ui")]
+pub mod network;
 pub mod session;
+#[cfg(feature = "web-ui")]
+pub mod spotify;
 pub mod sync;
+#[cfg(feature = "web-ui")]
+pub mod sysinfo;
 pub mod transport;
 #[cfg(feature = "web-ui")]
 pub mod web_ui;
