@@ -920,7 +920,12 @@ async fn run_endpoint(
                             Ok(()) => {
                                 #[cfg(feature = "web-ui")]
                                 {
-                                    let dev_name = audio.current_device_name().unwrap_or("unknown").to_string();
+                                    // Показывать реально выбранное устройство (после переключения
+                                    // из web UI current_audio_device = Some(...)), а не хардкод
+                                    // драйвера «alsa-direct» — иначе выбор карты «сбрасывается»
+                                    // в статусе при каждой смене трека.
+                                    let dev_name = current_audio_device.clone()
+                                        .unwrap_or_else(|| audio.current_device_name().unwrap_or("unknown").to_string());
                                     let fmt_s = fp.format.to_string();
                                     let sr = fp.sample_rate;
                                     let bits = fp.bits_per_sample;
